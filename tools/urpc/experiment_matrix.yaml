@@ -1,0 +1,54 @@
+# Formal DRC-YOLO26 experiment matrix (authoritative sections 16, 18, 22, and 23).
+# A `reuse_of` entry is documentation only: run_ablation.py still verifies the complete fingerprint,
+# including seed, model, weights, data split, source code, and every training argument before reuse.
+models:
+  baseline: {yaml: ultralytics/cfg/models/26/yolo26n.yaml}
+  p2: {yaml: ultralytics/cfg/models/26/yolo26n-p2.yaml}
+  cdr: {yaml: ultralytics/cfg/models/26/yolo26n-cdr.yaml}
+  sdr: {yaml: ultralytics/cfg/models/26/yolo26n-sdr.yaml}
+  ccq: {yaml: ultralytics/cfg/models/26/yolo26n-ccq.yaml}
+  cdr_sdr: {yaml: ultralytics/cfg/models/26/yolo26n-cdr-sdr.yaml}
+  cdr_ccq: {yaml: ultralytics/cfg/models/26/yolo26n-cdr-ccq.yaml}
+  sdr_ccq: {yaml: ultralytics/cfg/models/26/yolo26n-sdr-ccq.yaml}
+  full: {yaml: ultralytics/cfg/models/26/yolo26n-drc.yaml}
+  d1: {yaml: ultralytics/cfg/models/26/yolo26n-d1.yaml}
+  d2: {yaml: ultralytics/cfg/models/26/yolo26n-d2.yaml}
+  d3: {yaml: ultralytics/cfg/models/26/yolo26n-d3.yaml}
+  s1: {yaml: ultralytics/cfg/models/26/yolo26n-s1.yaml}
+  s2: {yaml: ultralytics/cfg/models/26/yolo26n-s2.yaml}
+  s3: {yaml: ultralytics/cfg/models/26/yolo26n-s3.yaml}
+  s4: {yaml: ultralytics/cfg/models/26/yolo26n-s4.yaml}
+  q1: {yaml: ultralytics/cfg/models/26/yolo26n-q1.yaml}
+  q2: {yaml: ultralytics/cfg/models/26/yolo26n-q2.yaml}
+  q3: {yaml: ultralytics/cfg/models/26/yolo26n-q3.yaml}
+  q4: {yaml: ultralytics/cfg/models/26/yolo26n-q4.yaml}
+
+experiments:
+  C0: {model: baseline, description: "YOLO26-N official P3/P4/P5"}
+  C1: {model: p2, description: "YOLO26-N-P2 official P2/P3/P4/P5"}
+  C5: {model: full, description: "DRC-YOLO26-N"}
+  A0: {model: baseline, reuse_of: C0}
+  A1: {model: cdr}
+  A2: {model: sdr}
+  A3: {model: ccq}
+  A4: {model: cdr_sdr}
+  A5: {model: cdr_ccq}
+  A6: {model: sdr_ccq}
+  A7: {model: full, reuse_of: C5}
+  D0: {model: baseline, reuse_of: C0}
+  D1: {model: d1}
+  D2: {model: d2}
+  D3: {model: d3}
+  D4: {model: cdr, reuse_of: A1}
+  S0: {model: baseline, reuse_of: C0}
+  S1: {model: s1}
+  S2: {model: s2}
+  S3: {model: s3}
+  S4: {model: s4}
+  S5: {model: sdr, reuse_of: A2}
+  Q0: {model: baseline, reuse_of: C0}
+  Q1: {model: q1}
+  Q2: {model: q2}
+  Q3: {model: q3}
+  Q4: {model: q4}
+  Q5: {model: ccq, reuse_of: A3}

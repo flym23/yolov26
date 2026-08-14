@@ -15,18 +15,7 @@ from ultralytics.utils import NOT_MACOS14
 from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_inference_mode
 
-from .block import (
-    DFL,
-    SAVPE,
-    BNContrastiveHead,
-    BoundaryQualityEstimator,
-    ContrastiveHead,
-    Proto,
-    Proto26,
-    RealNVP,
-    Residual,
-    SwiGLUFFN,
-)
+from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Proto26, RealNVP, Residual, SwiGLUFFN
 from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
@@ -35,7 +24,6 @@ __all__ = (
     "OBB",
     "Classify",
     "CCQDetect",
-    "DBQDetect",
     "Depth",
     "Detect",
     "Pose",
@@ -295,11 +283,9 @@ class CCQDetect(Detect):
         self.quality_beta = float(quality_beta)
         self.enable_quality = bool(enable_quality)
         cq = max(16, ch[0] // 4)
-        self.one2one_q = (
-            nn.ModuleList(nn.Sequential(DWConv(c, c, 3), Conv(c, cq, 1), nn.Conv2d(cq, 1, 1)) for c in ch)
-            if self.enable_quality
-            else nn.ModuleList()
-        )
+        self.one2one_q = nn.ModuleList(
+            nn.Sequential(DWConv(c, c, 3), Conv(c, cq, 1), nn.Conv2d(cq, 1, 1)) for c in ch
+        ) if self.enable_quality else nn.ModuleList()
 
     def forward_quality(self, x: list[torch.Tensor]) -> torch.Tensor:
         """Concatenate quality logits in the same level and anchor order as boxes and scores."""
@@ -333,7 +319,8 @@ class CCQDetect(Detect):
         if quality is not None:
             if quality.shape[0] != scores.shape[0] or quality.shape[-1] != scores.shape[-1]:
                 raise RuntimeError(
-                    f"CCQDetect quality-anchor mismatch: quality={tuple(quality.shape)}, scores={tuple(scores.shape)}."
+                    "CCQDetect quality-anchor mismatch: "
+                    f"quality={tuple(quality.shape)}, scores={tuple(scores.shape)}."
                 )
             scores = scores * quality.sigmoid().pow(self.quality_beta)
         return torch.cat((dbox, scores), dim=1)
@@ -344,70 +331,6 @@ class CCQDetect(Detect):
         bias = math.log(0.01 / 0.99)
         for quality_head in self.one2one_q:
             quality_head[-1].bias.data.fill_(bias)
-
-
-class DBQDetect(Detect):
-    """Dense-supervised boundary-quality head for end-to-end YOLO26."""
-
-    def __init__(
-        self,
-        nc: int = 80,
-        quality_beta: float = 0.25,
-        reg_max: int = 16,
-        end2end: bool = False,
-        ch: tuple = (),
-    ) -> None:
-        """Initialize the shared five-channel boundary-quality branch."""
-        if float(quality_beta) < 0:
-            raise ValueError(f"quality_beta must be non-negative, got {quality_beta}.")
-        super().__init__(nc=nc, reg_max=reg_max, end2end=end2end, ch=ch)
-        self.quality_beta = float(quality_beta)
-        self.quality_heads = nn.ModuleList(BoundaryQualityEstimator(c) for c in ch)
-
-    def forward_quality(self, x: list[torch.Tensor]) -> torch.Tensor:
-        """Return five quality logits in the same level and anchor order as detection outputs."""
-        if len(x) != self.nl:
-            raise ValueError(f"DBQDetect expects {self.nl} feature levels, got {len(x)}.")
-        batch_size = x[0].shape[0]
-        return torch.cat([self.quality_heads[i](x[i]).view(batch_size, 5, -1) for i in range(self.nl)], dim=-1)
-
-    def forward(
-        self, x: list[torch.Tensor]
-    ) -> dict[str, torch.Tensor] | torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Return quality-supervised one-to-many and one-to-one predictions."""
-        if not self.end2end:
-            return super().forward(x)
-        one2many = self.forward_head(x, **self.one2many)
-        if one2many:
-            one2many["quality"] = self.forward_quality(x)
-        x_detach = [feature.detach() for feature in x]
-        one2one = self.forward_head(x_detach, **self.one2one)
-        one2one["quality"] = self.forward_quality(x_detach)
-        preds = {"one2many": one2many, "one2one": one2one}
-        if self.training:
-            return preds
-        output = self.postprocess(self._inference(one2one).permute(0, 2, 1))
-        return output if self.export else (output, preds)
-
-    def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Decode boxes and apply additive, zero-centered quality-logit calibration."""
-        dbox = self._get_decode_boxes(x)
-        quality = x.get("quality")
-        if quality is None:
-            return torch.cat((dbox, x["scores"].sigmoid()), dim=1)
-        if quality.shape[1] != 5 or quality.shape[-1] != x["scores"].shape[-1]:
-            raise RuntimeError(
-                f"DBQ quality shape mismatch: quality={tuple(quality.shape)}, scores={tuple(x['scores'].shape)}"
-            )
-        quality_logit = 0.5 * quality[:, :4].mean(dim=1, keepdim=True) + 0.5 * quality[:, 4:5]
-        return torch.cat((dbox, (x["scores"] + self.quality_beta * quality_logit).sigmoid()), dim=1)
-
-    def bias_init(self) -> None:
-        """Initialize detection biases while preserving zero quality calibration."""
-        super().bias_init()
-        for quality_head in self.quality_heads:
-            nn.init.zeros_(quality_head.out.weight)
-            nn.init.zeros_(quality_head.out.bias)
 
 
 class Segment(Detect):

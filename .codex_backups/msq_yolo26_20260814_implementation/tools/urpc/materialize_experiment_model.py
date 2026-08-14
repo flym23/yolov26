@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
-"""Materialize immutable YAMLs for the DRC-YOLO26 and MSQ-YOLO26 ablation matrices.
+"""Materialize immutable YAMLs for the DRC-YOLO26 ablation matrix.
 
 The canonical module layouts remain the checked-in baseline/CDR/SDR/CCQ/DRC YAMLs.  This utility only selects
 one of those layouts and writes its documented, declarative ablation switches to a run-local YAML.  The launcher
@@ -27,30 +27,11 @@ BASE_MODELS = {
     "sdr": "yolo26-sdr.yaml",
     "ccq": "yolo26-ccq.yaml",
     "drc": "yolo26-drc.yaml",
-    "msq": "yolo26-msq.yaml",
 }
 CDR_FLAGS = {
-    "D1": {
-        "use_opponent": True,
-        "use_dual_highpass": False,
-        "use_reliability": False,
-        "use_router": False,
-        "zero_init": False,
-    },
-    "D2": {
-        "use_opponent": True,
-        "use_dual_highpass": True,
-        "use_reliability": False,
-        "use_router": False,
-        "zero_init": False,
-    },
-    "D3": {
-        "use_opponent": True,
-        "use_dual_highpass": True,
-        "use_reliability": True,
-        "use_router": False,
-        "zero_init": False,
-    },
+    "D1": {"use_opponent": True, "use_dual_highpass": False, "use_reliability": False, "use_router": False, "zero_init": False},
+    "D2": {"use_opponent": True, "use_dual_highpass": True, "use_reliability": False, "use_router": False, "zero_init": False},
+    "D3": {"use_opponent": True, "use_dual_highpass": True, "use_reliability": True, "use_router": False, "zero_init": False},
 }
 SDR_FLAGS = {
     "S1": {"mode": "stride_concat", "use_reliability_gate": False, "zero_init": False},
@@ -72,23 +53,6 @@ RECIPES = {
     **{key: ("sdr", "detect") for key in SDR_FLAGS},
     **{key: ("ccq", "ccq") for key in CCQ_FLAGS},
 }
-MSQ_RECIPES = {
-    "B1": {"base": "msq", "sagf": False, "dbq": False},
-    "B2": {"base": "baseline", "sagf": True, "dbq": False},
-    "B3": {"base": "baseline", "sagf": False, "dbq": True},
-    "B4": {"base": "msq", "sagf": True, "dbq": False},
-    "B5": {"base": "msq", "sagf": False, "dbq": True},
-    "B6": {"base": "baseline", "sagf": True, "dbq": True},
-}
-RECIPES.update({key: (value["base"], "msq") for key, value in MSQ_RECIPES.items()})
-DBQ_DEFAULTS = {
-    "quality_gain": 0.25,
-    "dense_gain": 0.5,
-    "sparse_gain": 1.0,
-    "sigma": 0.25,
-    "hard_neg_topk": 128,
-    "hard_neg_gain": 0.25,
-}
 
 
 def materialize(config_id: str, output: Path) -> Path:
@@ -100,22 +64,6 @@ def materialize(config_id: str, output: Path) -> Path:
     data.pop("yaml_file", None)
     data["scale"] = "n"
     data["experiment_id"] = config_id
-    if config_id in MSQ_RECIPES:
-        recipe = MSQ_RECIPES[config_id]
-        if recipe["sagf"] and recipe["base"] == "baseline":
-            data["head"][4] = [[-1, 4, 2], 1, "SemanticAgreementFusion", [0.25, 16, 32, 1.0, 0.0]]
-        elif not recipe["sagf"] and recipe["base"] == "msq":
-            data["head"][4] = [[-1, 4], 1, "Concat", [1]]
-        if recipe["dbq"]:
-            data["head"][-1][2] = "DBQDetect"
-            data["head"][-1][3] = ["nc", 0.25]
-            data["dbq"] = dict(DBQ_DEFAULTS)
-        else:
-            data["head"][-1][2] = "Detect"
-            data["head"][-1][3] = ["nc"]
-            data.pop("dbq", None)
-        YAML.save(output, data, header="# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license\n")
-        return output
     if config_id in CDR_FLAGS:
         data["backbone"][0][3].append(CDR_FLAGS[config_id])
     if config_id in SDR_FLAGS:

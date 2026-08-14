@@ -1312,102 +1312,6 @@ class E2ELoss:
         return max(1 - x / max(self.one2one.hyp.epochs - 1, 1), 0) * (self.o2m_copy - self.final_o2m) + self.final_o2m
 
 
-class DBQE2ELoss(E2ELoss):
-    """YOLO26 progressive E2E loss plus dense/sparse boundary-quality supervision."""
-
-    def __init__(self, model: torch.nn.Module):
-        """Initialize DBQ gains and the shared quality BCE."""
-        super().__init__(model)
-        cfg = model.yaml.get("dbq", {}) or {}
-        self.quality_gain = float(cfg.get("quality_gain", 0.25))
-        self.dense_gain = float(cfg.get("dense_gain", 0.5))
-        self.sparse_gain = float(cfg.get("sparse_gain", 1.0))
-        self.sigma = float(cfg.get("sigma", 0.25))
-        self.hard_neg_topk = int(cfg.get("hard_neg_topk", 128))
-        self.hard_neg_gain = float(cfg.get("hard_neg_gain", 0.25))
-        self.quality_bce = nn.BCEWithLogitsLoss(reduction="none")
-        if self.quality_gain < 0 or self.dense_gain < 0 or self.sparse_gain < 0:
-            raise ValueError("DBQ loss gains must be non-negative.")
-        if self.sigma <= 0:
-            raise ValueError(f"DBQ sigma must be positive, got {self.sigma}.")
-        if self.hard_neg_topk < 0:
-            raise ValueError(f"DBQ hard_neg_topk must be non-negative, got {self.hard_neg_topk}.")
-
-    @staticmethod
-    def _decode_branch(criterion, preds: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        """Decode one branch to pixel-space xyxy boxes and anchor-major class logits."""
-        pred_dist = preds["boxes"].permute(0, 2, 1).contiguous()
-        anchor_points, stride_tensor = make_anchors(preds["feats"], criterion.stride, 0.5)
-        return criterion.bbox_decode(anchor_points, pred_dist) * stride_tensor, preds["scores"].permute(
-            0, 2, 1
-        ).contiguous()
-
-    def _quality_targets(self, pred_boxes: torch.Tensor, target_boxes: torch.Tensor) -> torch.Tensor:
-        """Create [left, top, right, bottom, IoU] quality targets in [0, 1]."""
-        pred = pred_boxes.detach()
-        wh = (target_boxes[:, 2:4] - target_boxes[:, 0:2]).clamp_min(1.0)
-        scale = torch.stack((wh[:, 0], wh[:, 1], wh[:, 0], wh[:, 1]), dim=-1)
-        side_quality = torch.exp(-((pred - target_boxes).abs() / scale) / self.sigma).clamp_(0, 1)
-        iou_quality = bbox_iou(pred, target_boxes, xywh=False).squeeze(-1).clamp_(0, 1)
-        return torch.cat((side_quality, iou_quality.unsqueeze(-1)), dim=-1)
-
-    def _branch_quality_loss(
-        self,
-        preds: dict[str, torch.Tensor],
-        assignment: tuple[torch.Tensor, ...],
-        pred_boxes: torch.Tensor,
-        pred_scores: torch.Tensor,
-    ) -> torch.Tensor:
-        """Supervise positive boundary/IoU quality and bounded high-score negatives."""
-        quality = preds.get("quality")
-        zero = pred_boxes.sum() * 0.0
-        if quality is None:
-            return zero
-        quality = quality.permute(0, 2, 1).contiguous()
-        if quality.shape[-1] != 5 or quality.shape[:2] != pred_boxes.shape[:2]:
-            raise RuntimeError(
-                f"DBQ quality-anchor mismatch: quality={tuple(quality.shape)}, boxes={tuple(pred_boxes.shape)}"
-            )
-        fg_mask, _, target_bboxes, *_ = assignment
-        fg_mask = fg_mask.bool()
-        positive_loss = zero
-        if bool(fg_mask.any()):
-            batch_idx, anchor_idx = fg_mask.nonzero(as_tuple=True)
-            targets = self._quality_targets(pred_boxes[batch_idx, anchor_idx], target_bboxes[batch_idx, anchor_idx])
-            positive_loss = self.quality_bce(quality[batch_idx, anchor_idx], targets).mean()
-        k = min(self.hard_neg_topk, pred_scores.shape[1])
-        if k == 0:
-            return positive_loss
-        negative_score = pred_scores.detach().sigmoid().amax(dim=-1).masked_fill(fg_mask, -1.0)
-        negative_idx = negative_score.topk(k, dim=1).indices
-        valid_negative = (~fg_mask).gather(1, negative_idx)
-        negative_logits = quality.gather(1, negative_idx.unsqueeze(-1).expand(-1, -1, 5))
-        negative_loss = self.quality_bce(negative_logits, torch.zeros_like(negative_logits)).mean(dim=-1)
-        negative_loss = (negative_loss * valid_negative).sum() / valid_negative.sum().clamp_min(1)
-        return positive_loss + self.hard_neg_gain * negative_loss
-
-    def __call__(self, preds, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Keep progressive E2E loss and add DBQ supervision to both branches."""
-        preds = self.one2many.parse_output(preds)
-        one2many, one2one = preds["one2many"], preds["one2one"]
-        assignment_many, loss_many, _ = self.one2many.get_assigned_targets_and_loss(one2many, batch)
-        assignment_one, loss_one, log_one = self.one2one.get_assigned_targets_and_loss(one2one, batch)
-        boxes_many, scores_many = self._decode_branch(self.one2many, one2many)
-        boxes_one, scores_one = self._decode_branch(self.one2one, one2one)
-        quality_many = self._branch_quality_loss(one2many, assignment_many, boxes_many, scores_many)
-        quality_one = self._branch_quality_loss(one2one, assignment_one, boxes_one, scores_one)
-        batch_size = boxes_one.shape[0]
-        base_loss = (loss_many * self.o2m + loss_one * self.o2o) * batch_size
-        quality_loss = (self.dense_gain * quality_many + self.sparse_gain * quality_one) * self.quality_gain
-        loss_vector = torch.cat((base_loss, (quality_loss * batch_size).reshape(1)))
-        return loss_vector, {
-            **log_one,
-            "dbq_quality_loss": quality_loss.detach(),
-            "dbq_dense_quality": quality_many.detach(),
-            "dbq_sparse_quality": quality_one.detach(),
-        }
-
-
 class CCQE2ELoss(E2ELoss):
     """End-to-end loss with one-to-many consensus teaching and one-to-one quality calibration."""
 
@@ -1430,10 +1334,8 @@ class CCQE2ELoss(E2ELoss):
         head = model.model[-1] if hasattr(model, "model") else None
         self.use_quality = bool(cfg.get("use_quality", getattr(head, "enable_quality", True)))
         configured_beta = float(cfg.get("quality_beta", getattr(head, "quality_beta", 0.5)))
-        if (
-            head is not None
-            and hasattr(head, "quality_beta")
-            and not math.isclose(float(head.quality_beta), configured_beta, rel_tol=0.0, abs_tol=1e-12)
+        if head is not None and hasattr(head, "quality_beta") and not math.isclose(
+            float(head.quality_beta), configured_beta, rel_tol=0.0, abs_tol=1e-12
         ):
             raise ValueError(
                 "CCQ quality_beta mismatch between YAML head args and ccq config: "
@@ -1566,9 +1468,7 @@ class CCQE2ELoss(E2ELoss):
                 group_idx = batch_idx * n_max_boxes + target_gt_idx[batch_idx, anchor_idx].long()
                 _, reliability, teacher_valid = teacher_data
                 positive_weight = torch.where(
-                    teacher_valid[group_idx],
-                    reliability[group_idx].to(dtype=positive_bce.dtype),
-                    torch.ones_like(positive_bce),
+                    teacher_valid[group_idx], reliability[group_idx].to(dtype=positive_bce.dtype), torch.ones_like(positive_bce)
                 )
                 quality_loss = (positive_bce * positive_weight).sum() / positive_weight.sum().clamp_min(self.eps)
         k = min(self.hard_neg_topk, student_scores.shape[1])
@@ -1591,9 +1491,7 @@ class CCQE2ELoss(E2ELoss):
         boxes_many, scores_many = self._decode_branch(self.one2many, one2many)
         boxes_one, scores_one = self._decode_branch(self.one2one, one2one)
         teacher_data = self._consensus_teacher(boxes_many, scores_many, assignment_many) if self.use_consensus else None
-        ccq_box_loss = (
-            self._ccq_box_loss(boxes_one, assignment_one, teacher_data) if self.use_consensus else boxes_one.sum() * 0.0
-        )
+        ccq_box_loss = self._ccq_box_loss(boxes_one, assignment_one, teacher_data) if self.use_consensus else boxes_one.sum() * 0.0
         quality_loss = self._quality_loss(one2one, boxes_one, assignment_one, scores_one, teacher_data)
         batch_size = boxes_one.shape[0]
         base_loss = loss_many * self.o2m + loss_one * self.o2o

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
-"""Run a YOLO26 ablation chain with three concurrent seeds per experiment."""
+"""Run the DRC-YOLO26 A0-A7 chain with three concurrent seeds per ablation."""
 
 from __future__ import annotations
 
@@ -31,18 +31,8 @@ from tools.urpc.materialize_experiment_model import RECIPES, materialize  # noqa
 
 
 MATRIX_PATH = Path(__file__).with_name("experiment_matrix.yaml")
-DEFAULT_PROJECTS = {
-    "drc": ROOT / "runs" / "drc_yolo26_a0_a7",
-    "msq": ROOT / "runs" / "msq_yolo26_b0_b7",
-}
-EXPERIMENT_SCHEMES = {
-    "drc": tuple(f"A{index}" for index in range(8)),
-    "msq": tuple(f"B{index}" for index in range(8)),
-}
-SCHEME_NAMES = {
-    "drc": "drc_yolo26_a0_a7",
-    "msq": "msq_yolo26_b0_b7",
-}
+DEFAULT_PROJECT = ROOT / "runs" / "drc_yolo26_a0_a7"
+EXPERIMENTS = tuple(f"A{index}" for index in range(8))
 SEEDS = (0, 1, 2)
 TRAIN_KEYS = ("imgsz", "batch", "epochs", "patience", "device", "workers", "amp", "deterministic", "plots")
 CODE_FILES = (
@@ -101,7 +91,7 @@ def model_path(value: str) -> Path:
     for scale in "nsm lx".replace(" ", ""):
         marker = f"yolo26{scale}"
         if name.startswith(marker):
-            resolved = candidate.with_name(f"yolo26{name[len(marker) :]}")
+            resolved = candidate.with_name(f"yolo26{name[len(marker):]}")
             if resolved.is_file():
                 return resolved.resolve()
     raise FileNotFoundError(f"Model YAML does not exist and no scale alias resolved it: {value}")
@@ -126,7 +116,9 @@ def dataset_fingerprint(data: Path) -> dict[str, str]:
             hashes[f"{split}_list"] = sha256_file(path)
         elif path.is_dir():
             inventory = [
-                (str(item.relative_to(path)), item.stat().st_size) for item in sorted(path.rglob("*")) if item.is_file()
+                (str(item.relative_to(path)), item.stat().st_size)
+                for item in sorted(path.rglob("*"))
+                if item.is_file()
             ]
             hashes[f"{split}_inventory"] = stable_hash(inventory)
         else:
@@ -171,13 +163,13 @@ def git_commit() -> str | None:
     return result.stdout.strip() if result.returncode == 0 else None
 
 
-def default_config(scheme: str) -> dict[str, Any]:
-    """Return the fixed training configuration for one registered YOLO26 ablation scheme."""
+def default_config() -> dict[str, Any]:
+    """Return the fixed DRC-YOLO26 A0-A7 training configuration."""
     matrix = yaml.safe_load(MATRIX_PATH.read_text(encoding="utf-8"))
     return {
         "data": None,
         "pretrained": "yolo26n.pt",
-        "project": str(DEFAULT_PROJECTS[scheme]),
+        "project": str(DEFAULT_PROJECT),
         "imgsz": 640,
         "batch": 16,
         "epochs": 300,
@@ -203,7 +195,7 @@ def merge_config(config: dict[str, Any], override: dict[str, Any]) -> dict[str, 
 
 def load_config(path: Path | None, args: argparse.Namespace) -> dict[str, Any]:
     """Load an optional YAML over the fixed experiment defaults."""
-    config = default_config(args.scheme)
+    config = default_config()
     if path:
         loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         if not isinstance(loaded, dict):
@@ -228,25 +220,22 @@ def load_config(path: Path | None, args: argparse.Namespace) -> dict[str, Any]:
     }
     mismatched = {key: config.get(key) for key, expected in required.items() if config.get(key) != expected}
     if mismatched:
-        raise ValueError(f"Training configuration differs from the fixed YOLO26 ablation protocol: {mismatched}")
+        raise ValueError(f"Training configuration differs from the fixed DRC-YOLO26 protocol: {mismatched}")
     if list(config["seeds"]) != list(SEEDS):
-        raise ValueError("The YOLO26 ablation protocol requires exactly seeds [0, 1, 2].")
+        raise ValueError("The DRC-YOLO26 protocol requires exactly seeds [0, 1, 2].")
     return config
 
 
-def selected_experiments(config: dict[str, Any], requested: str | None, scheme: str) -> list[str]:
-    """Return requested identifiers in canonical order for the selected scheme."""
-    identifiers = EXPERIMENT_SCHEMES[scheme]
-    wanted = (
-        list(identifiers) if not requested else [item.strip().upper() for item in requested.split(",") if item.strip()]
-    )
-    unknown = sorted(set(wanted) - set(identifiers))
+def selected_experiments(config: dict[str, Any], requested: str | None) -> list[str]:
+    """Return requested A0-A7 identifiers in canonical order."""
+    wanted = list(EXPERIMENTS) if not requested else [item.strip().upper() for item in requested.split(",") if item.strip()]
+    unknown = sorted(set(wanted) - set(EXPERIMENTS))
     if unknown:
-        raise ValueError(f"Only {','.join(identifiers)} are valid for this chain; received: {', '.join(unknown)}")
+        raise ValueError(f"Only A0-A7 are valid for this chain; received: {', '.join(unknown)}")
     missing = sorted(set(wanted) - set(config["experiments"]))
     if missing:
         raise ValueError(f"Experiment matrix is missing: {', '.join(missing)}")
-    return [identifier for identifier in identifiers if identifier in wanted]
+    return [identifier for identifier in EXPERIMENTS if identifier in wanted]
 
 
 def resolve_experiment_model(experiment_id: str, declared: str, project: Path) -> tuple[Path, str]:
@@ -379,9 +368,7 @@ def run_group(jobs: list[dict[str, Any]], state_path: Path, state: dict[str, Any
             log_handles.append(handle)
             command = command_for(job)
             job.update(status="running", started_at=utcnow(), command=command, log=str(log_path))
-            atomic_json(
-                state_path.parent / "train" / "manifests" / f"{job['experiment_id']}_seed{job['seed']}.json", job
-            )
+            atomic_json(state_path.parent / "train" / "manifests" / f"{job['experiment_id']}_seed{job['seed']}.json", job)
             processes.append(
                 subprocess.Popen(
                     command,
@@ -414,16 +401,12 @@ def run_group(jobs: list[dict[str, Any]], state_path: Path, state: dict[str, Any
             train_dir = Path(job["train_dir"])
             required = [train_dir / "weights" / "last.pt", train_dir / "results.csv"]
             if job["stage"] == "formal":
-                required.extend(
-                    (Path(job["test_dir"]) / name for name in ("summary_metrics.json", "scale_ap_metrics.json"))
-                )
+                required.extend((Path(job["test_dir"]) / name for name in ("summary_metrics.json", "scale_ap_metrics.json")))
             missing = [str(path) for path in required if not path.is_file()]
             if missing:
                 raise RuntimeError(f"Worker completed without required artifacts: {missing}")
             job.update(status="completed", completed_at=utcnow(), exit_code=0)
-            atomic_json(
-                state_path.parent / "train" / "manifests" / f"{job['experiment_id']}_seed{job['seed']}.json", job
-            )
+            atomic_json(state_path.parent / "train" / "manifests" / f"{job['experiment_id']}_seed{job['seed']}.json", job)
     except BaseException:
         stop_processes(processes)
         status = "cancelled" if CANCEL_REQUESTED else "failed"
@@ -494,7 +477,7 @@ def summarize_chain(project: Path, summaries: list[dict[str, Any]]) -> None:
 
 
 def main() -> None:
-    """Execute a selected experiment chain with seeds 0/1/2 concurrent within each experiment."""
+    """Execute A0-A7 sequentially, with seeds 0/1/2 concurrent within each experiment."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--data", required=True)
@@ -502,8 +485,7 @@ def main() -> None:
     parser.add_argument("--project", required=True, help="Absolute immutable run root.")
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--stage", choices=("smoke", "formal"), default="formal")
-    parser.add_argument("--scheme", choices=tuple(EXPERIMENT_SCHEMES), default="drc")
-    parser.add_argument("--ids", help="Comma-separated subset of the selected scheme; defaults to all eight.")
+    parser.add_argument("--ids", help="Comma-separated subset of A0-A7; defaults to all eight.")
     parser.add_argument("--upstream-state", help="Recorded terminal state that released this chain.")
     parser.add_argument("--upstream-status", choices=("completed", "failed", "cancelled"))
     parser.add_argument("--upstream-reason", default="")
@@ -526,11 +508,11 @@ def main() -> None:
         ):
             raise FileExistsError(f"Run ID is not immutable/unique because state already exists: {state_path}")
     config = load_config(args.config, args)
-    identifiers = selected_experiments(config, args.ids, args.scheme)
+    identifiers = selected_experiments(config, args.ids)
     project.mkdir(parents=True, exist_ok=True)
     state = waiting_state or {
         "schema_version": 1,
-        "scheme": SCHEME_NAMES[args.scheme],
+        "scheme": "drc_yolo26_a0_a7",
         "run_id": args.run_id,
         "stage": args.stage,
         "started_at": utcnow(),

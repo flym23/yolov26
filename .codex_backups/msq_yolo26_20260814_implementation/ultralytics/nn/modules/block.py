@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -33,7 +31,6 @@ __all__ = (
     "ADown",
     "Attention",
     "BNContrastiveHead",
-    "BoundaryQualityEstimator",
     "Bottleneck",
     "BottleneckCSP",
     "C2f",
@@ -50,7 +47,6 @@ __all__ = (
     "HGBlock",
     "HGStem",
     "ImagePoolingAttn",
-    "MorphologyRFBlock",
     "Proto",
     "RepC3",
     "RepNCSPELAN4",
@@ -58,7 +54,6 @@ __all__ = (
     "ResNetLayer",
     "SCDown",
     "SDRFusion",
-    "SemanticAgreementFusion",
     "TorchVision",
 )
 
@@ -138,9 +133,7 @@ class CDRStem(Conv):
             reliability = base.new_ones((base.shape[0], 1, *base.shape[-2:]))
         else:
             reliability_input = torch.cat((high3.abs(), high5.abs(), (high3 - high5).abs()), dim=1)
-            reliability = torch.sigmoid(
-                self.reliability_head(F.adaptive_avg_pool2d(reliability_input, base.shape[-2:]))
-            )
+            reliability = torch.sigmoid(self.reliability_head(F.adaptive_avg_pool2d(reliability_input, base.shape[-2:])))
         context, detail = self.context_branch(opponent), self.detail_branch(high3)
         if context.shape != base.shape or detail.shape != base.shape:
             raise RuntimeError(
@@ -268,9 +261,7 @@ class SDRFusion(nn.Module):
         if self.p2_stride is not None:
             detail = self.p2_stride(p2)
             if detail.shape[-2:] != p3.shape[-2:]:
-                raise RuntimeError(
-                    f"Stride P2 fusion shape mismatch: detail={tuple(detail.shape)}, p3={tuple(p3.shape)}."
-                )
+                raise RuntimeError(f"Stride P2 fusion shape mismatch: detail={tuple(detail.shape)}, p3={tuple(p3.shape)}.")
             return torch.cat((top_down, p3, detail), dim=1)
 
         reduced_p2 = self.p2_reduce(p2)
@@ -296,188 +287,6 @@ class SDRFusion(nn.Module):
         )
         enhanced_p3 = p3 + torch.tanh(self.alpha).to(dtype=p3.dtype) * gate * detail
         return torch.cat((top_down, enhanced_p3), dim=1)
-
-
-class MorphologyRFBlock(nn.Module):
-    """Morphology-oriented receptive-field routing with an identity-preserving residual path."""
-
-    def __init__(
-        self,
-        c1: int,
-        c2: int,
-        k: int = 7,
-        dilation: int = 2,
-        router_hidden: int = 16,
-        alpha_init: float = 0.0,
-    ) -> None:
-        """Initialize receptive-field experts and a zero-initialized morphology router."""
-        super().__init__()
-        if k < 3 or k % 2 == 0:
-            raise ValueError(f"k must be an odd integer >= 3, got {k}.")
-        if dilation < 1:
-            raise ValueError(f"dilation must be >= 1, got {dilation}.")
-        self.c1, self.c2 = int(c1), int(c2)
-        self.base = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
-        self.iso = Conv(c2, c2, 3, 1, g=c2)
-        self.horz = Conv(c2, c2, (1, k), 1, g=c2)
-        self.vert = Conv(c2, c2, (k, 1), 1, g=c2)
-        self.context = Conv(c2, c2, 3, 1, g=c2, d=dilation)
-        hidden = max(8, int(router_hidden))
-        self.router = nn.Sequential(
-            nn.Conv2d(4, hidden, 3, 1, 1, bias=False),
-            nn.BatchNorm2d(hidden),
-            nn.SiLU(),
-            nn.Conv2d(hidden, 5, 1, bias=True),
-        )
-        self.mix_project = Conv(c2, c2, 1, 1)
-        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
-        nn.init.zeros_(self.router[-1].weight)
-        nn.init.zeros_(self.router[-1].bias)
-
-    @staticmethod
-    def _morphology_stats(x: torch.Tensor) -> torch.Tensor:
-        """Return magnitude, horizontal, vertical, and local-detail cues."""
-        if x.ndim != 4:
-            raise ValueError(f"MorphologyRFBlock expects BCHW input, got shape={tuple(x.shape)}.")
-        magnitude = x.abs().mean(dim=1, keepdim=True)
-        gx = F.pad((x[..., 1:] - x[..., :-1]).abs().mean(dim=1, keepdim=True), (0, 1, 0, 0))
-        gy = F.pad((x[..., 1:, :] - x[..., :-1, :]).abs().mean(dim=1, keepdim=True), (0, 0, 0, 1))
-        detail = (magnitude - F.avg_pool2d(magnitude, kernel_size=3, stride=1, padding=1)).abs()
-        return torch.cat((magnitude, gx, gy, detail), dim=1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Route spatial experts while preserving the base path at alpha=0."""
-        base = self.base(x)
-        weights = self.router(self._morphology_stats(base)).softmax(dim=1)
-        experts = torch.stack((base, self.iso(base), self.horz(base), self.vert(base), self.context(base)), dim=1)
-        mixed = self.mix_project((experts * weights.unsqueeze(2)).sum(dim=1))
-        return base + torch.tanh(self.alpha).to(dtype=base.dtype) * (mixed - base)
-
-
-class SemanticAgreementFusion(nn.Module):
-    """Semantic-agreement gated P2-to-P3 detail fusion with four subpixel phases."""
-
-    def __init__(
-        self,
-        ch: tuple[int, int, int] | list[int],
-        reduce_ratio: float = 0.25,
-        min_channels: int = 16,
-        route_hidden: int = 32,
-        temperature: float = 1.0,
-        alpha_init: float = 0.0,
-    ) -> None:
-        """Initialize phase projection, semantic routing, and reliability gating."""
-        super().__init__()
-        if len(ch) != 3:
-            raise ValueError(f"SemanticAgreementFusion expects exactly 3 input channels, got ch={ch}.")
-        if not 0.0 < float(reduce_ratio) <= 1.0:
-            raise ValueError(f"reduce_ratio must be in (0, 1], got {reduce_ratio}.")
-        if float(temperature) <= 0:
-            raise ValueError(f"temperature must be > 0, got {temperature}.")
-        self.c_td, self.c_p3, self.c_p2 = map(int, ch)
-        self.c_red = make_divisible(max(int(min_channels), int(self.c_p2 * float(reduce_ratio))), 8)
-        self.out_channels = self.c_td + self.c_p3
-        self.temperature = float(temperature)
-        self.p2_reduce = Conv(self.c_p2, self.c_red, 1, 1)
-        self.group_project = nn.Sequential(
-            Conv(self.c_red, self.c_p3, 1, 1),
-            Conv(self.c_p3, self.c_p3, 3, 1, g=self.c_p3),
-        )
-        route_hidden = max(16, int(route_hidden))
-        self.semantic_query = Conv(self.c_td + self.c_p3, self.c_p3, 1, 1)
-        self.route_context = Conv(self.c_td + self.c_p3, route_hidden, 1, 1)
-        self.route_head = nn.Sequential(
-            Conv(route_hidden + 4, route_hidden, 3, 1),
-            nn.Conv2d(route_hidden, 4, 1, bias=True),
-        )
-        gate_hidden = max(16, self.c_p3 // 4)
-        self.gate_head = nn.Sequential(
-            Conv(self.c_p3 * 2 + 2, gate_hidden, 1, 1),
-            nn.Conv2d(gate_hidden, 1, 1, bias=True),
-        )
-        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
-        nn.init.zeros_(self.route_head[-1].weight)
-        nn.init.zeros_(self.route_head[-1].bias)
-        nn.init.zeros_(self.gate_head[-1].weight)
-        nn.init.zeros_(self.gate_head[-1].bias)
-
-    @staticmethod
-    def pixel_unshuffle_groups(x: torch.Tensor, factor: int = 2) -> torch.Tensor:
-        """Return true subpixel phases as [B, factor**2, C, H/factor, W/factor]."""
-        if x.ndim != 4:
-            raise ValueError(f"Expected BCHW input, got shape={tuple(x.shape)}.")
-        if factor <= 0 or x.shape[-2] % factor or x.shape[-1] % factor:
-            raise ValueError(f"Spatial size {tuple(x.shape[-2:])} must be divisible by factor={factor}.")
-        y = F.pixel_unshuffle(x, factor)
-        batch, _, height, width = y.shape
-        return y.reshape(batch, x.shape[1], factor * factor, height, width).permute(0, 2, 1, 3, 4).contiguous()
-
-    def forward(self, x: list[torch.Tensor] | tuple[torch.Tensor, ...]) -> torch.Tensor:
-        """Fuse [top-down P3, backbone P3, backbone P2] without changing the baseline at alpha=0."""
-        if not isinstance(x, (list, tuple)) or len(x) != 3:
-            raise ValueError("SemanticAgreementFusion expects [top_down_p3, backbone_p3, backbone_p2].")
-        top_down, p3, p2 = x
-        if top_down.ndim != 4 or p3.ndim != 4 or p2.ndim != 4:
-            raise ValueError("All SemanticAgreementFusion inputs must be BCHW tensors.")
-        if (top_down.shape[1], p3.shape[1], p2.shape[1]) != (self.c_td, self.c_p3, self.c_p2):
-            raise ValueError(
-                f"Channel mismatch: expected={(self.c_td, self.c_p3, self.c_p2)}, "
-                f"got={(top_down.shape[1], p3.shape[1], p2.shape[1])}."
-            )
-        if top_down.shape[-2:] != p3.shape[-2:]:
-            raise ValueError(f"P3 sizes must match, got {top_down.shape[-2:]} and {p3.shape[-2:]}.")
-        expected_p2 = (p3.shape[-2] * 2, p3.shape[-1] * 2)
-        if p2.shape[-2:] != expected_p2:
-            raise ValueError(f"P2 must be exactly 2x P3, got P2={p2.shape[-2:]}, P3={p3.shape[-2:]}.")
-        groups = self.pixel_unshuffle_groups(self.p2_reduce(p2), factor=2)
-        batch, group_count, _, height, width = groups.shape
-        if group_count != 4:
-            raise RuntimeError(f"Expected four subpixel groups, got {group_count}.")
-        projected = self.group_project(groups.reshape(batch * 4, self.c_red, height, width)).reshape(
-            batch, 4, self.c_p3, height, width
-        )
-        semantic_input = torch.cat((top_down, p3), dim=1)
-        semantic = self.semantic_query(semantic_input)
-        agreement = (
-            (F.normalize(projected, dim=2, eps=1e-6) * F.normalize(semantic, dim=1, eps=1e-6).unsqueeze(1))
-            .sum(dim=2)
-            .clamp(-1.0, 1.0)
-            + 1.0
-        ) * 0.5
-        phase_energy = groups.abs().mean(dim=2)
-        phase_energy = phase_energy / (phase_energy.mean(dim=1, keepdim=True) + 1e-6)
-        route_logits = self.route_head(torch.cat((self.route_context(semantic_input), phase_energy), dim=1))
-        route_weight = (route_logits / self.temperature + torch.log(agreement.clamp_min(1e-4))).softmax(dim=1)
-        detail = (projected * route_weight.unsqueeze(2)).sum(dim=1)
-        weighted_agreement = (agreement * route_weight).sum(dim=1, keepdim=True)
-        entropy = -(route_weight.clamp_min(1e-6) * route_weight.clamp_min(1e-6).log()).sum(
-            dim=1, keepdim=True
-        ) / math.log(4.0)
-        gate = torch.sigmoid(self.gate_head(torch.cat((p3, detail, weighted_agreement, entropy), dim=1)))
-        enhanced_p3 = p3 + torch.tanh(self.alpha).to(dtype=p3.dtype) * gate * detail
-        return torch.cat((top_down, enhanced_p3), dim=1)
-
-
-class BoundaryQualityEstimator(nn.Module):
-    """Predict left/top/right/bottom boundary quality plus global IoU quality."""
-
-    def __init__(self, c: int, hidden_ratio: float = 0.25, min_channels: int = 16) -> None:
-        """Initialize morphology-aware quality estimation with a zero-initialized output."""
-        super().__init__()
-        hidden = make_divisible(max(int(min_channels), int(c * float(hidden_ratio))), 8)
-        self.stem = Conv(c, hidden, 1, 1)
-        self.local = Conv(hidden, hidden, 3, 1, g=hidden)
-        self.horz = Conv(hidden, hidden, (1, 5), 1, g=hidden)
-        self.vert = Conv(hidden, hidden, (5, 1), 1, g=hidden)
-        self.fuse = Conv(hidden * 3, hidden, 1, 1)
-        self.out = nn.Conv2d(hidden, 5, 1, bias=True)
-        nn.init.zeros_(self.out.weight)
-        nn.init.zeros_(self.out.bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Return five boundary/IoU quality logits."""
-        z = self.stem(x)
-        return self.out(self.fuse(torch.cat((self.local(z), self.horz(z), self.vert(z)), dim=1)))
 
 
 class DFL(nn.Module):

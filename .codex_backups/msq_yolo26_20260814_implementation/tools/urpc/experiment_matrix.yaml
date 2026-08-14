@@ -22,13 +22,6 @@ models:
   q2: {yaml: ultralytics/cfg/models/26/yolo26n-q2.yaml}
   q3: {yaml: ultralytics/cfg/models/26/yolo26n-q3.yaml}
   q4: {yaml: ultralytics/cfg/models/26/yolo26n-q4.yaml}
-  morf: {yaml: ultralytics/cfg/models/26/yolo26n-morf.yaml}
-  sagf: {yaml: ultralytics/cfg/models/26/yolo26n-sagf.yaml}
-  dbq: {yaml: ultralytics/cfg/models/26/yolo26n-dbq.yaml}
-  morf_sagf: {yaml: ultralytics/cfg/models/26/yolo26n-morf-sagf.yaml}
-  morf_dbq: {yaml: ultralytics/cfg/models/26/yolo26n-morf-dbq.yaml}
-  sagf_dbq: {yaml: ultralytics/cfg/models/26/yolo26n-sagf-dbq.yaml}
-  msq: {yaml: ultralytics/cfg/models/26/yolo26n-msq.yaml}
 
 experiments:
   C0: {model: baseline, description: "YOLO26-N official P3/P4/P5"}
@@ -59,11 +52,3 @@ experiments:
   Q3: {model: q3}
   Q4: {model: q4}
   Q5: {model: ccq, reuse_of: A3}
-  B0: {model: baseline, description: "YOLO26-N baseline"}
-  B1: {model: morf, description: "MORF only"}
-  B2: {model: sagf, description: "SAGF only"}
-  B3: {model: dbq, description: "DBQ only"}
-  B4: {model: morf_sagf, description: "MORF plus SAGF"}
-  B5: {model: morf_dbq, description: "MORF plus DBQ"}
-  B6: {model: sagf_dbq, description: "SAGF plus DBQ"}
-  B7: {model: msq, description: "MSQ-YOLO26"}

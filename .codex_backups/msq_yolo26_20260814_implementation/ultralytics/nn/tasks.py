@@ -49,7 +49,6 @@ from ultralytics.nn.modules import (
     Conv2,
     ConvTranspose,
     Depth,
-    DBQDetect,
     Detect,
     DWConv,
     DWConvTranspose2d,
@@ -61,7 +60,6 @@ from ultralytics.nn.modules import (
     ImagePoolingAttn,
     Index,
     LRPCHead,
-    MorphologyRFBlock,
     Pose,
     Pose26,
     RepC3,
@@ -72,7 +70,6 @@ from ultralytics.nn.modules import (
     RTDETRDecoder,
     SCDown,
     SDRFusion,
-    SemanticAgreementFusion,
     Segment,
     Segment26,
     SemanticSegment,
@@ -98,7 +95,6 @@ from ultralytics.utils.checks import REMOTE_FILE_PREFIXES, check_file, check_req
 from ultralytics.utils.loss import (
     DepthLoss26,
     CCQE2ELoss,
-    DBQE2ELoss,
     E2ELoss,
     PoseLoss26,
     SemanticSegmentationLoss,
@@ -605,8 +601,6 @@ class DetectionModel(BaseModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
-        if isinstance(self.model[-1], DBQDetect):
-            return DBQE2ELoss(self)
         if isinstance(self.model[-1], CCQDetect):
             return CCQE2ELoss(self)
         return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
@@ -2018,7 +2012,6 @@ def parse_model(d, ch, verbose=True):
             C2fCIB,
             A2C2f,
             CDRStem,
-            MorphologyRFBlock,
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -2113,16 +2106,9 @@ def parse_model(d, ch, verbose=True):
             }.get(mode)
             if c2 is None:
                 raise ValueError(f"Unsupported SDRFusion mode={mode!r}.")
-        elif m is SemanticAgreementFusion:
-            in_ch = [ch[x] for x in f]
-            if len(in_ch) != 3:
-                raise ValueError(f"SemanticAgreementFusion expects exactly 3 inputs, got {len(in_ch)}")
-            args = [in_ch, *args]
-            c2 = in_ch[0] + in_ch[1]
         elif m in frozenset(
             {
                 CCQDetect,
-                DBQDetect,
                 Detect,
                 WorldDetect,
                 YOLOEDetect,
@@ -2136,9 +2122,7 @@ def parse_model(d, ch, verbose=True):
                 OBB26,
             }
         ):
-            if m is DBQDetect:
-                args.extend([reg_max, end2end, [ch[x] for x in f]])
-            elif m is CCQDetect:
+            if m is CCQDetect:
                 # CCQDetect has an explicit quality-head switch between quality_beta and reg_max.
                 # Keeping it in the YAML makes Q0-Q5 ablations architecture-level and checkpoint-safe.
                 enable_quality = bool(args.pop(2)) if len(args) > 2 else True
@@ -2147,20 +2131,7 @@ def parse_model(d, ch, verbose=True):
                 args.extend([reg_max, end2end, [ch[x] for x in f]])
             if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {
-                CCQDetect,
-                DBQDetect,
-                Detect,
-                YOLOEDetect,
-                Segment,
-                Segment26,
-                YOLOESegment,
-                YOLOESegment26,
-                Pose,
-                Pose26,
-                OBB,
-                OBB26,
-            }:
+            if m in {CCQDetect, Detect, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:
                 m.legacy = legacy
         elif m is Depth:
             args = [*args[:1], [ch[x] for x in f]]  # c_mid, ch tuple; drops the legacy mode arg old checkpoints store

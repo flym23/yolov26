@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,114 @@ from ultralytics.utils.torch_utils import autocast
 
 from .metrics import bbox_iou, probiou
 from .tal import bbox2dist, rbox2dist
+
+
+@dataclass(frozen=True)
+class ReLiAStatisticReference:
+    """Persisted train-set P1/P99 intervals for the PWD statistic guard."""
+
+    intervals: dict[str, tuple[float, float]]
+
+    @classmethod
+    def from_json(cls, path: str | Path) -> "ReLiAStatisticReference":
+        """Load the immutable dataset snapshot generated before a RELiA run."""
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        intervals = {name: (float(metric["p01"]), float(metric["p99"])) for name, metric in payload["metrics"].items()}
+        if not intervals:
+            raise ValueError(f"RELiA statistics file is empty: {path}")
+        return cls(intervals)
+
+
+@dataclass
+class PairedWeatherOutput:
+    """Generated PWD tensors, actual applied delta, severity field and retry count."""
+
+    degraded: torch.Tensor
+    delta: torch.Tensor
+    severity: torch.Tensor
+    retries: torch.Tensor
+
+
+def relia_image_statistics(images: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Measure the audited PWD guard statistics on normalized RGB image batches."""
+    images = F.interpolate(images, size=(160, 160), mode="bilinear", align_corners=False)
+    luminance = images[:, :1] * 0.299 + images[:, 1:2] * 0.587 + images[:, 2:3] * 0.114
+    dx, dy = luminance[..., :, 1:] - luminance[..., :, :-1], luminance[..., 1:, :] - luminance[..., :-1, :]
+    laplace = -4 * luminance + torch.roll(luminance, 1, 2) + torch.roll(luminance, -1, 2) + torch.roll(luminance, 1, 3) + torch.roll(luminance, -1, 3)
+    channel_mean = images.mean((2, 3))
+    saturation = (images.amax(1, keepdim=True) - images.amin(1, keepdim=True)) / (images.amax(1, keepdim=True) + 1e-6)
+    return {
+        "mean": images.mean((1, 2, 3)),
+        "std": images.std((1, 2, 3), unbiased=False),
+        "luminance_p01": torch.quantile(luminance.flatten(1), 0.01, dim=1),
+        "luminance_p99": torch.quantile(luminance.flatten(1), 0.99, dim=1),
+        "sobel_energy": (dx.square().mean((1, 2, 3)) + dy.square().mean((1, 2, 3))).sqrt(),
+        "laplacian_variance": laplace.flatten(1).var(1, unbiased=False),
+        "color_bias": channel_mean.std(1, unbiased=False),
+        "saturation": saturation.mean((1, 2, 3)),
+    }
+
+
+class PairedWeatherDegradation(nn.Module):
+    """Training-only PWD with field-wise nine-dimensional perturbations and statistical retries."""
+
+    def __init__(self, reference: ReLiAStatisticReference | None = None, max_retries: int = 3) -> None:
+        """Set conservative ranges for RGB gains/biases, blur, noise and exposure."""
+        super().__init__()
+        self.reference, self.max_retries = reference, int(max_retries)
+        self.register_buffer("ranges", torch.tensor((0.04, 0.04, 0.04, 0.02, 0.02, 0.02, 0.20, 0.008, 0.06)))
+
+    def set_reference(self, reference: ReLiAStatisticReference) -> None:
+        """Attach real training-set statistics before paired training begins."""
+        self.reference = reference
+
+    def _degrade(self, raw: torch.Tensor, delta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply smooth local colour/exposure fields plus blur/noise without changing geometry or labels."""
+        batch, _, height, width = raw.shape
+        field = F.interpolate(torch.randn(batch, 1, 8, 8, device=raw.device, dtype=raw.dtype), (height, width), mode="bilinear", align_corners=False).tanh()
+        alpha, beta = delta[:, :3, None, None] * field, delta[:, 3:6, None, None] * field
+        exposure = (1 + delta[:, 8:9, None, None] * field).clamp(0.65, 1.35)
+        degraded = raw * (1 + alpha) * exposure + beta
+        blur = delta[:, 6].abs().view(batch, 1, 1, 1).clamp(max=0.5)
+        degraded = degraded.lerp(F.avg_pool2d(F.pad(degraded, (1, 1, 1, 1), mode="reflect"), 3, 1), blur)
+        degraded = (degraded + torch.randn_like(degraded) * delta[:, 7].abs().view(batch, 1, 1, 1)).clamp(0, 1)
+        severity = (field.abs() * (delta[:, :6].abs().mean(1, keepdim=True).view(batch, 1, 1, 1) + blur + delta[:, 7].abs().view(batch, 1, 1, 1))).clamp(0, 1)
+        return degraded, severity
+
+    def _accepted(self, degraded: torch.Tensor) -> torch.Tensor:
+        """Require every audited metric to remain inside P1/P99 expanded by ten percent."""
+        if self.reference is None:
+            raise RuntimeError("RELiA PWD requires real training-set statistics before training.")
+        accepted = torch.ones(len(degraded), dtype=torch.bool, device=degraded.device)
+        for name, values in relia_image_statistics(degraded).items():
+            low, high = self.reference.intervals[name]
+            padding = 0.1 * max(high - low, 1e-6)
+            accepted &= (values >= low - padding) & (values <= high + padding)
+        return accepted
+
+    def forward(self, raw: torch.Tensor) -> PairedWeatherOutput:
+        """Create a PWD pair and halve each rejected sample's actual delta before each retry."""
+        if not self.training:
+            raise RuntimeError("PWD is training-only and cannot run in RELiA inference/export.")
+        delta = (torch.rand(len(raw), 9, device=raw.device, dtype=raw.dtype) * 2 - 1) * self.ranges.to(raw)
+        retries = torch.zeros(len(raw), dtype=torch.long, device=raw.device)
+        degraded, severity = self._degrade(raw, delta)
+        for _ in range(self.max_retries):
+            rejected = ~self._accepted(degraded)
+            if not bool(rejected.any()):
+                break
+            delta[rejected] *= 0.5
+            retries[rejected] += 1
+            candidate, candidate_severity = self._degrade(raw[rejected], delta[rejected])
+            degraded, severity = degraded.clone(), severity.clone()
+            degraded[rejected], severity[rejected] = candidate, candidate_severity
+        rejected = ~self._accepted(degraded)
+        if bool(rejected.any()):
+            degraded, severity, delta = degraded.clone(), severity.clone(), delta.clone()
+            degraded[rejected] = raw[rejected]
+            severity[rejected] = 0
+            delta[rejected] = 0
+        return PairedWeatherOutput(degraded, delta, severity, retries)
 
 
 class VarifocalLoss(nn.Module):
@@ -1310,6 +1420,133 @@ class E2ELoss:
     def decay(self, x) -> float:
         """Calculate the decayed weight for one-to-many loss based on the current update step."""
         return max(1 - x / max(self.one2one.hyp.epochs - 1, 1), 0) * (self.o2m_copy - self.final_o2m) + self.final_o2m
+
+
+def _relia_split_paired(value: Any, batch_size: int):
+    """Split tensors nested in native head outputs from a concatenated pair forward."""
+    if isinstance(value, torch.Tensor):
+        return value[:batch_size], value[batch_size:]
+    if isinstance(value, dict):
+        values = {name: _relia_split_paired(item, batch_size) for name, item in value.items()}
+        return {name: item[0] for name, item in values.items()}, {name: item[1] for name, item in values.items()}
+    if isinstance(value, (list, tuple)):
+        values = [_relia_split_paired(item, batch_size) for item in value]
+        return type(value)(item[0] for item in values), type(value)(item[1] for item in values)
+    return value, value
+
+
+def _relia_object_masks(batch: dict[str, torch.Tensor], height: int, width: int, device: torch.device):
+    """Create foreground/boundary masks from unchanged GT boxes for PSR weighting."""
+    foreground = torch.zeros(batch["img"].shape[0], 1, height, width, device=device)
+    for image_index, box in zip(batch["batch_idx"].view(-1), batch["bboxes"]):
+        index = int(image_index)
+        cx, cy, bw, bh = box.to(device)
+        x1, y1 = int(torch.floor((cx - bw / 2).clamp(0, 1) * width)), int(torch.floor((cy - bh / 2).clamp(0, 1) * height))
+        x2, y2 = int(torch.ceil((cx + bw / 2).clamp(0, 1) * width)), int(torch.ceil((cy + bh / 2).clamp(0, 1) * height))
+        foreground[index, :, y1:max(y1 + 1, y2), x1:max(x1 + 1, x2)] = 1
+    return foreground, (F.max_pool2d(foreground, 3, 1, 1) - foreground).clamp_(0, 1)
+
+
+def _relia_redpa_loss(raw: dict[str, torch.Tensor], degraded: dict[str, torch.Tensor], delta: torch.Tensor, severity: torch.Tensor):
+    """Supervise code differences and P3/P4 severity-logit increments, never absolute weather class labels."""
+    terms = [F.smooth_l1_loss(degraded["code"] - raw["code"], delta)]
+    for level in ("p3", "p4"):
+        target = F.interpolate(severity, raw[f"severity_{level}"].shape[-2:], mode="bilinear", align_corners=False).detach()
+        increment = degraded[f"severity_{level}"] - raw[f"severity_{level}"]
+        terms.extend((F.smooth_l1_loss(increment.sigmoid(), target), F.binary_cross_entropy_with_logits(raw[f"severity_{level}"], torch.zeros_like(target)), F.relu(target.mean((1, 2, 3)) - increment.mean((1, 2, 3))).mean()))
+    return sum(terms) / len(terms)
+
+
+def _relia_psr_loss(raw: dict[str, dict[str, torch.Tensor]], degraded: dict[str, dict[str, torch.Tensor]], batch: dict[str, torch.Tensor]):
+    """Pair-rank routing by detached un-routed projections, with foreground/boundary/hard-background emphasis."""
+    total = torch.zeros((), device=batch["img"].device)
+    for level in ("p4", "p3"):
+        raw_level, degraded_level = raw[level], degraded[level]
+        logits = torch.cat((raw_level["route_logits"], degraded_level["route_logits"]), 0)
+        with torch.no_grad():
+            local_change = (raw_level["local_projected"] - degraded_level["local_projected"]).abs().mean(1, keepdim=True)
+            semantic_change = (raw_level["semantic_projected"] - degraded_level["semantic_projected"]).abs().mean(1, keepdim=True)
+            target = torch.cat((-local_change, -semantic_change), 1).softmax(1)
+            foreground, boundary = _relia_object_masks(batch, *logits.shape[-2:], logits.device)
+            energy = local_change + semantic_change
+            hard_background = (1 - foreground) * (energy >= energy.flatten(1).median(1).values[:, None, None, None])
+            weights = torch.cat((1 + foreground + boundary + hard_background, 1 + foreground + boundary + hard_background), 0)
+            target = torch.cat((target, target), 0)
+        total += (-(target * logits.log_softmax(1)).sum(1, keepdim=True) * weights).sum() / weights.sum().clamp_min(1)
+    return total / 2
+
+
+def _relia_dsq_loss(prediction: dict[str, torch.Tensor], assignment: tuple, loss_fn: v8DetectionLoss, hard_negatives: int):
+    """Build detached quality targets from the canonical native one-to-one assignment for DSQ only."""
+    foreground, target_gt_idx, target_bboxes, anchor_points, stride_tensor = assignment
+    foreground = foreground.bool()
+    logits, scores = prediction["quality"].squeeze(1), prediction["scores"].detach().sigmoid().amax(1)
+    with torch.no_grad():
+        boxes = loss_fn.bbox_decode(anchor_points, prediction["boxes"].permute(0, 2, 1).contiguous()).detach() * stride_tensor
+        target, selected = torch.zeros_like(logits), torch.zeros_like(foreground)
+        for batch_index in range(logits.shape[0]):
+            positive = foreground[batch_index].nonzero(as_tuple=False).flatten()
+            for gt_index in target_gt_idx[batch_index, positive].unique():
+                candidates = positive[target_gt_idx[batch_index, positive] == gt_index]
+                if len(candidates):
+                    representative = candidates[scores[batch_index, candidates].argmax()]
+                    target[batch_index, representative] = bbox_iou(boxes[batch_index, representative], target_bboxes[batch_index, representative], xywh=False, CIoU=False).clamp(0, 1) * scores[batch_index, representative]
+                    selected[batch_index, representative] = True
+            negatives = (~foreground[batch_index]).nonzero(as_tuple=False).flatten()
+            if len(negatives):
+                selected[batch_index, negatives[scores[batch_index, negatives].topk(min(hard_negatives, len(negatives))).indices]] = True
+    selected |= foreground
+    return F.binary_cross_entropy_with_logits(logits[selected], target[selected]) if selected.any() else logits.sum() * 0
+
+
+class ReLiAE2ELoss(E2ELoss):
+    """Retain native STAL/progressive E2E loss, adding only paired ReDPA/PSR/DSQ supervision."""
+
+    def __init__(self, model: nn.Module):
+        """Read declared gains without changing any native assignment, matching, or loss schedule."""
+        super().__init__(model)
+        config = model.yaml.get("relia", {})
+        self.redpa_gain, self.psr_gain, self.dsq_gain = float(config.get("redpa_gain", 0.25)), float(config.get("psr_gain", 0.2)), float(config.get("dsq_gain", 0.25))
+        self.hard_negatives = int(config.get("dsq_hard_negatives", 128))
+
+    def _native(self, prediction: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]):
+        """Calculate native one-to-many/one-to-one losses once and keep the canonical one-to-one assignment."""
+        o2m_assignment, o2m_loss, _ = self.one2many.get_assigned_targets_and_loss(prediction["one2many"], batch)
+        o2o_assignment, o2o_loss, detached = self.one2one.get_assigned_targets_and_loss(prediction["one2one"], batch)
+        return (
+            (o2m_loss.sum() * self.o2m + o2o_loss.sum() * self.o2o) * prediction["one2one"]["boxes"].shape[0],
+            detached,
+            o2m_assignment,
+            o2o_assignment,
+        )
+
+    def __call__(self, prediction: dict[str, torch.Tensor], batch: dict[str, torch.Tensor], paired: dict[str, Any]):
+        """Average raw/degraded native losses, then back-propagate each auxiliary loss only through its owner."""
+        raw_prediction, degraded_prediction = _relia_split_paired(prediction, batch["img"].shape[0])
+        raw_context, degraded_context = _relia_split_paired(paired["context"], batch["img"].shape[0])
+        raw_native, raw_items, raw_o2m_assignment, raw_o2o_assignment = self._native(raw_prediction, batch)
+        degraded_native, degraded_items, degraded_o2m_assignment, degraded_o2o_assignment = self._native(degraded_prediction, batch)
+        total = (raw_native + degraded_native) * 0.5
+        items = {f"raw/{name}": value for name, value in raw_items.items()}
+        items.update({f"degraded/{name}": value for name, value in degraded_items.items()})
+        if "redpa" in raw_context:
+            value = _relia_redpa_loss(raw_context["redpa"], degraded_context["redpa"], paired["delta"], paired["severity"])
+            total += self.redpa_gain * value
+            items["relia/redpa"] = value.detach()
+        if "psr" in raw_context:
+            value = _relia_psr_loss(raw_context["psr"], degraded_context["psr"], batch)
+            total += self.psr_gain * value
+            items["relia/psr"] = value.detach()
+        if "quality" in raw_prediction["one2one"]:
+            value = 0.25 * (
+                _relia_dsq_loss(raw_prediction["one2many"], raw_o2m_assignment, self.one2many, self.hard_negatives)
+                + _relia_dsq_loss(degraded_prediction["one2many"], degraded_o2m_assignment, self.one2many, self.hard_negatives)
+                + _relia_dsq_loss(raw_prediction["one2one"], raw_o2o_assignment, self.one2one, self.hard_negatives)
+                + _relia_dsq_loss(degraded_prediction["one2one"], degraded_o2o_assignment, self.one2one, self.hard_negatives)
+            )
+            total += self.dsq_gain * value
+            items["relia/dsq"] = value.detach()
+        return total, items
 
 
 class CCQE2ELoss(E2ELoss):

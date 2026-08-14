@@ -8,6 +8,7 @@ import re
 import threading
 from copy import deepcopy
 from pathlib import Path
+from typing import Any
 
 import torch
 from torch import nn
@@ -50,6 +51,7 @@ from ultralytics.nn.modules import (
     ConvTranspose,
     Depth,
     Detect,
+    DSQDetect,
     DWConv,
     DWConvTranspose2d,
     Focus,
@@ -62,6 +64,7 @@ from ultralytics.nn.modules import (
     LRPCHead,
     Pose,
     Pose26,
+    RelativeDegradationPromptAdapter,
     RepC3,
     RepConv,
     RepNCSPELAN4,
@@ -73,6 +76,7 @@ from ultralytics.nn.modules import (
     Segment,
     Segment26,
     SemanticSegment,
+    StabilityRoutingFusion,
     TorchVision,
     WorldDetect,
     YOLOEDetect,
@@ -93,10 +97,13 @@ from ultralytics.utils import (
 )
 from ultralytics.utils.checks import REMOTE_FILE_PREFIXES, check_file, check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
-    DepthLoss26,
     CCQE2ELoss,
+    DepthLoss26,
     E2ELoss,
+    PairedWeatherDegradation,
     PoseLoss26,
+    ReLiAE2ELoss,
+    ReLiAStatisticReference,
     SemanticSegmentationLoss,
     v8ClassificationLoss,
     v8DetectionLoss,
@@ -604,6 +611,145 @@ class DetectionModel(BaseModel):
         if isinstance(self.model[-1], CCQDetect):
             return CCQE2ELoss(self)
         return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+
+
+class ReLiADetectionModel(DetectionModel):
+    """YOLO26 detector with training-only ReDPA/PSR/DSQ RELiA extensions."""
+
+    _p2_index, _p3_index, _p4_index = 2, 4, 6
+    _psr_p4_index, _psr_p3_index = 12, 15
+
+    def __init__(self, cfg="yolo26-relia.yaml", ch=3, nc=None, verbose=True):
+        """Build the untouched YOLO26 graph, then attach only the enabled RELiA owners."""
+        self._relia_ready = False
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+        self.relia = dict(self.yaml.get("relia", {}))
+        self.enable_redpa = self._module_enabled("redpa")
+        self.enable_psr = self._module_enabled("psr")
+        self.enable_dsq = self._module_enabled("dsq")
+        if not any((self.enable_redpa, self.enable_psr, self.enable_dsq)):
+            raise ValueError("All-disabled RELiA is forbidden: use the exact standard YOLO26 YAML for A0.")
+        self._validate_relia_topology()
+        code_dim = int(self.relia.get("code_dim", 9))
+        p2_channels = self.model[2].cv2.conv.out_channels
+        p3_channels = self.model[4].cv2.conv.out_channels
+        p4_channels = self.model[6].cv2.conv.out_channels
+        p5_channels = self.model[10].cv2.conv.out_channels
+        self.redpa = (
+            RelativeDegradationPromptAdapter(p2_channels, p3_channels, int(self.relia.get("prompt_channels", 64)), code_dim)
+            if self.enable_redpa
+            else None
+        )
+        self.psr_p4 = StabilityRoutingFusion(p4_channels, p5_channels, code_dim) if self.enable_psr else None
+        self.psr_p3 = StabilityRoutingFusion(p3_channels, p4_channels, code_dim) if self.enable_psr else None
+        self.pwd = PairedWeatherDegradation()
+        if self.enable_dsq:
+            self._install_dsq_head()
+        self._paired_context = None
+        self._validation_criterion = None
+        self._relia_ready = True
+
+    def _module_enabled(self, name: str) -> bool:
+        """Read one module switch from the audited nested or legacy flat RELiA YAML schema."""
+        module = self.relia.get(name, False)
+        return bool(module.get("enabled", False)) if isinstance(module, dict) else bool(module)
+
+    def _validate_relia_topology(self) -> None:
+        """Fail fast if a RELiA YAML stops being the audited P3/P4/P5 YOLO26 topology."""
+        if len(self.model) != 24 or not all(isinstance(self.model[index], Concat) for index in (12, 15)):
+            raise ValueError("RELiA requires the audited 24-layer YOLO26 P3/P4/P5 topology with top-down Concat at 12/15.")
+        if not isinstance(self.model[-1], Detect) or not self.model[-1].end2end or self.model[-1].reg_max != 1:
+            raise ValueError("RELiA requires the native YOLO26 end2end=True and reg_max=1 Detect contract.")
+
+    def _install_dsq_head(self) -> None:
+        """Replace only the final Detect owner while preserving all native weight keys and output geometry."""
+        native = self.model[-1]
+        channels = tuple(branch[0].conv.in_channels for branch in native.cv2)
+        dsq = DSQDetect(
+            nc=native.nc,
+            quality_alpha=float(self.relia.get("quality_alpha", 0.5)),
+            reg_max=native.reg_max,
+            end2end=native.end2end,
+            ch=channels,
+        )
+        dsq.load_state_dict(native.state_dict(), strict=False)
+        dsq.i, dsq.f, dsq.type, dsq.np = native.i, native.f, native.type, native.np
+        dsq.stride = native.stride
+        dsq.legacy = native.legacy
+        self.model[-1] = dsq
+        dsq.bias_init()
+
+    def configure_paired_degradation(self, statistics_path: str | Path) -> None:
+        """Attach a persisted real-training-set statistics reference before any PWD forward."""
+        self.pwd.set_reference(ReLiAStatisticReference.from_json(statistics_path))
+
+    def _relia_forward(self, x: torch.Tensor, capture_aux: bool) -> tuple[Any, dict[str, dict[str, torch.Tensor]]]:
+        """Execute the native graph, replacing only its two audited top-down concat owners when PSR is enabled."""
+        saved, context = [], {}
+        prompt = None
+        for module in self.model:
+            if module.f != -1:
+                if self.enable_psr and module.i == self._psr_p4_index:
+                    x, aux = self.psr_p4(saved[self._p4_index], x, prompt["map_p4"], prompt["code"], capture_aux)
+                    if capture_aux:
+                        context.setdefault("psr", {})["p4"] = aux
+                    saved.append(x)
+                    continue
+                if self.enable_psr and module.i == self._psr_p3_index:
+                    x, aux = self.psr_p3(saved[self._p3_index], x, prompt["map_p3"], prompt["code"], capture_aux)
+                    if capture_aux:
+                        context.setdefault("psr", {})["p3"] = aux
+                    saved.append(x)
+                    continue
+                x = saved[module.f] if isinstance(module.f, int) else [x if source == -1 else saved[source] for source in module.f]
+            x = module(x)
+            if module.i == self._p2_index:
+                if self.enable_redpa:
+                    prompt = self.redpa.prompt(x, (max(1, x.shape[-2] // 2), max(1, x.shape[-1] // 2)))
+                    x = self.redpa.adapt_p2(x, prompt)
+                else:
+                    prompt = {
+                        "code": x.new_zeros(x.shape[0], int(self.relia.get("code_dim", 9))),
+                        "map_p3": x.new_zeros(x.shape[0], 1, max(1, x.shape[-2] // 2), max(1, x.shape[-1] // 2)),
+                        "map_p4": x.new_zeros(x.shape[0], 1, max(1, x.shape[-2] // 4), max(1, x.shape[-1] // 4)),
+                    }
+            if module.i == self._p3_index and self.enable_redpa:
+                x = self.redpa.adapt_p3(x, prompt)
+                if capture_aux:
+                    context["redpa"] = {name: prompt[name] for name in ("code", "severity_p3", "severity_p4")}
+            saved.append(x)
+        return x, context
+
+    def _predict_once(self, x, profile=False, visualize=False, embed=None):
+        """Use a raw/degraded concatenated forward only while training; inference remains one native-shape pass."""
+        if not self._relia_ready:
+            return super()._predict_once(x, profile, visualize, embed)
+        if self.training and self.pwd.reference is not None:
+            paired = self.pwd(x)
+            output, context = self._relia_forward(torch.cat((x, paired.degraded), 0), capture_aux=True)
+            self._paired_context = {"context": context, "delta": paired.delta, "severity": paired.severity, "retries": paired.retries}
+            return output
+        output, _ = self._relia_forward(x, capture_aux=False)
+        return output
+
+    def loss(self, batch, preds=None):
+        """Consume the cached paired forward and keep PWD entirely outside validation/inference/export paths."""
+        if not self.training:
+            if self._validation_criterion is None:
+                self._validation_criterion = E2ELoss(self)
+            return self._validation_criterion(preds, batch)
+        if getattr(self, "criterion", None) is None:
+            self.criterion = self.init_criterion()
+        if preds is None:
+            preds = self.predict(batch["img"])
+        if self._paired_context is None:
+            raise RuntimeError("RELiA loss requires the paired training forward produced by PWD.")
+        context, self._paired_context = self._paired_context, None
+        return self.criterion(preds, batch, context)
+
+    def init_criterion(self):
+        """Use native E2E assignments plus RELiA auxiliary supervision only for this model class."""
+        return ReLiAE2ELoss(self)
 
 
 class OBBModel(DetectionModel):
@@ -1699,7 +1845,7 @@ class _SafeLoad:
                 for info in pkgutil.iter_modules(pkg.__path__, f"{pkg.__name__}."):
                     try:
                         mods.append(importlib.import_module(info.name))
-                    except Exception:  # noqa: S112  # optional/oddball submodule — skip
+                    except ImportError:
                         continue
             for mod in mods:
                 for name, klass in inspect.getmembers(mod, inspect.isclass):
@@ -2188,7 +2334,7 @@ def yaml_model_load(path):
     unified_path = re.sub(r"(\d+)([nslmx])(.+)?$", r"\1\3", str(path))  # i.e. yolov8x.yaml -> yolov8.yaml
     yaml_file = check_yaml(unified_path, hard=False) or check_yaml(path)
     d = YAML.load(yaml_file)  # model dict
-    d["scale"] = guess_model_scale(path)
+    d["scale"] = guess_model_scale(path) or d.get("scale", "")
     d["yaml_file"] = str(path)
     return d
 

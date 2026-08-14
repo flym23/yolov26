@@ -17,6 +17,7 @@ from ultralytics.nn.tasks import (
     DetectionModel,
     OBBModel,
     PoseModel,
+    ReLiADetectionModel,
     SegmentationModel,
     SemanticSegmentationModel,
     WorldModel,
@@ -88,7 +89,7 @@ class YOLO(Model):
     @property
     def task_map(self) -> dict[str, dict[str, Any]]:
         """Map head to model, trainer, validator, and predictor classes."""
-        return {
+        task_map = {
             "classify": {
                 "model": ClassificationModel,
                 "trainer": yolo.classify.ClassificationTrainer,
@@ -132,6 +133,20 @@ class YOLO(Model):
                 "predictor": yolo.semantic.SemanticSegmentationPredictor,
             },
         }
+        cfg = getattr(self, "cfg", None)
+        relia = False
+        if cfg:
+            try:
+                relia_config = YAML.load(cfg).get("relia")
+            except (OSError, TypeError):
+                relia_config = cfg.get("relia") if isinstance(cfg, dict) else None
+            relia = bool(relia_config) and (
+                not isinstance(relia_config, dict) or bool(relia_config.get("enabled", True))
+            )
+        if relia:
+            task_map["detect"]["model"] = ReLiADetectionModel
+            task_map["detect"]["trainer"] = yolo.detect.ReLiADetectionTrainer
+        return task_map
 
 
 class YOLOWorld(Model):

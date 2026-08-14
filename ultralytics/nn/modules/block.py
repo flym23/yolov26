@@ -51,11 +51,123 @@ __all__ = (
     "RepC3",
     "RepNCSPELAN4",
     "RepVGGDW",
+    "RelativeDegradationPromptAdapter",
     "ResNetLayer",
     "SCDown",
     "SDRFusion",
+    "StabilityRoutingFusion",
     "TorchVision",
 )
+
+
+class DegradationPromptEncoder(nn.Module):
+    """Infer a nine-dimensional relative degradation code and P3/P4 severity logits from P2."""
+
+    def __init__(self, c2: int, prompt_channels: int = 64, code_dim: int = 9) -> None:
+        """Initialize the single-stride P2-to-P3 prompt encoder."""
+        super().__init__()
+        self.stem = Conv(c2, prompt_channels, 1, 1)
+        self.down_to_p3 = nn.Sequential(DWConv(prompt_channels, prompt_channels, 3, 2), Conv(prompt_channels, prompt_channels, 1, 1))
+        self.local_head = nn.Conv2d(prompt_channels, 1, 1)
+        self.global_head = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(1), nn.Linear(prompt_channels, 2 * prompt_channels), nn.SiLU(inplace=True), nn.Linear(2 * prompt_channels, code_dim), nn.Tanh())
+
+    def forward(self, p2: torch.Tensor, p3_size: tuple[int, int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return code and P3/P4 severity logits aligned to the real P3 geometry."""
+        feature = self.down_to_p3(self.stem(p2))
+        if feature.shape[-2:] != p3_size:
+            feature = F.interpolate(feature, size=p3_size, mode="bilinear", align_corners=False)
+        logits_p3 = self.local_head(feature)
+        return self.global_head(feature), logits_p3, F.avg_pool2d(logits_p3, 2, 2, ceil_mode=True)
+
+
+class DegradationConditionedAdapter(nn.Module):
+    """Bounded residual adapter with exact zero-initialized output and modulation projections."""
+
+    def __init__(self, channels: int, code_dim: int = 9, gamma_max: float = 0.1, beta_max: float = 0.1) -> None:
+        """Initialize an exact identity residual path for the baseline initialization."""
+        super().__init__()
+        self.gamma_max, self.beta_max = float(gamma_max), float(beta_max)
+        self.residual = nn.Sequential(DWConv(channels, channels, 3, 1), nn.Conv2d(channels, channels, 1))
+        self.modulation = nn.Sequential(nn.Linear(code_dim, max(16, min(128, channels // 2))), nn.SiLU(inplace=True), nn.Linear(max(16, min(128, channels // 2)), 2 * channels))
+        nn.init.zeros_(self.residual[-1].weight)
+        nn.init.zeros_(self.residual[-1].bias)
+        nn.init.zeros_(self.modulation[-1].weight)
+        nn.init.zeros_(self.modulation[-1].bias)
+
+    def forward(self, feature: torch.Tensor, severity: torch.Tensor, code: torch.Tensor) -> torch.Tensor:
+        """Apply severity-gated bounded modulation while retaining identity at zero initialization."""
+        severity = F.interpolate(severity, size=feature.shape[-2:], mode="bilinear", align_corners=False)
+        gamma, beta = self.modulation(code).chunk(2, 1)
+        gamma = self.gamma_max * gamma.tanh().unsqueeze(-1).unsqueeze(-1)
+        beta = self.beta_max * beta.tanh().unsqueeze(-1).unsqueeze(-1)
+        return feature + severity * ((1 + gamma) * self.residual(feature) + beta)
+
+
+class RelativeDegradationPromptAdapter(nn.Module):
+    """Single-stride P2-to-P3 ReDPA and exact-identity P2/P3 adapters."""
+
+    def __init__(self, p2_channels: int, p3_channels: int, prompt_channels: int = 64, code_dim: int = 9) -> None:
+        """Initialize one P2-to-P3 prompt path and the P2/P3 residual adapters."""
+        super().__init__()
+        self.encoder = DegradationPromptEncoder(p2_channels, prompt_channels, code_dim)
+        self.p2_adapter = DegradationConditionedAdapter(p2_channels, code_dim)
+        self.p3_adapter = DegradationConditionedAdapter(p3_channels, code_dim)
+
+    def prompt(self, p2: torch.Tensor, p3_size: tuple[int, int]) -> dict[str, torch.Tensor]:
+        """Create one prompt at P2, before its adapted feature enters the P3 downsampling layer."""
+        code, logits_p3, logits_p4 = self.encoder(p2, p3_size)
+        return {
+            "code": code,
+            "severity_p3": logits_p3,
+            "severity_p4": logits_p4,
+            "map_p3": logits_p3.sigmoid(),
+            "map_p4": logits_p4.sigmoid(),
+        }
+
+    def adapt_p2(self, p2: torch.Tensor, prompt: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Adapt P2 before it is consumed by the native P3 downsampling convolution."""
+        return self.p2_adapter(p2, prompt["map_p3"], prompt["code"])
+
+    def adapt_p3(self, p3: torch.Tensor, prompt: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Adapt the resulting P3 with the same single P2-derived degradation prompt."""
+        return self.p3_adapter(p3, prompt["map_p3"], prompt["code"])
+
+    def forward(self, p2: torch.Tensor, p3: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """Return adapted P2/P3 maps and their train-only prompt tensors."""
+        prompt = self.prompt(p2, p3.shape[-2:])
+        return self.adapt_p2(p2, prompt), self.adapt_p3(p3, prompt), prompt
+
+
+class StabilityRoutingFusion(nn.Module):
+    """Top-down Concat replacement with two-way zero-initialized reliability routing."""
+
+    def __init__(self, lateral_channels: int, semantic_channels: int, code_dim: int = 9, route_channels: int = 16, code_channels: int = 8) -> None:
+        """Initialize projection paths and a router whose initial output is exactly concat-equivalent."""
+        super().__init__()
+        self.lateral_channels, self.semantic_channels = lateral_channels, semantic_channels
+        self.lateral_route, self.semantic_route = Conv(lateral_channels, route_channels, 1, 1), Conv(semantic_channels, route_channels, 1, 1)
+        distance_channels = max(lateral_channels, semantic_channels)
+        self.local_distance = nn.Identity() if lateral_channels == distance_channels else Conv(lateral_channels, distance_channels, 1, 1)
+        self.semantic_distance = nn.Identity() if semantic_channels == distance_channels else Conv(semantic_channels, distance_channels, 1, 1)
+        self.code_projection = nn.Linear(code_dim, code_channels)
+        router_in = 2 * route_channels + code_channels + 3
+        self.router = nn.Sequential(DWConv(router_in, router_in, 3, 1), Conv(router_in, route_channels, 1, 1), nn.Conv2d(route_channels, 2, 1))
+        nn.init.zeros_(self.router[-1].weight)
+        nn.init.zeros_(self.router[-1].bias)
+
+    def forward(self, lateral: torch.Tensor, semantic: torch.Tensor, severity: torch.Tensor, code: torch.Tensor, capture_aux: bool = False):
+        """Route lateral/semantic features; loss targets use the detached un-routed projections captured here."""
+        semantic = F.interpolate(semantic, size=lateral.shape[-2:], mode="nearest") if semantic.shape[-2:] != lateral.shape[-2:] else semantic
+        severity = F.interpolate(severity, size=lateral.shape[-2:], mode="bilinear", align_corners=False)
+        local, high = self.local_distance(lateral), self.semantic_distance(semantic)
+        difference = (local - high).abs()
+        code_map = self.code_projection(code).unsqueeze(-1).unsqueeze(-1).expand(-1, -1, *lateral.shape[-2:])
+        logits = self.router(torch.cat((self.lateral_route(lateral), self.semantic_route(semantic), difference.mean(1, keepdim=True), difference.amax(1, keepdim=True), severity, code_map), 1))
+        weights = logits.softmax(1)
+        routed = torch.cat((2 * weights[:, :1] * lateral, 2 * weights[:, 1:] * semantic), 1)
+        if not capture_aux:
+            return routed, None
+        return routed, {"route_logits": logits, "local_projected": local.detach(), "semantic_projected": high.detach()}
 
 
 class CDRStem(Conv):

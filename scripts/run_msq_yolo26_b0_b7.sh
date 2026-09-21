@@ -31,13 +31,14 @@ case "$UPSTREAM_STATUS" in completed|failed|cancelled) ;; *) echo "Invalid upstr
 ACTUAL_STATUS=$("$PYTHON" -c "import json, sys; from pathlib import Path; print(json.loads(Path(sys.argv[1]).read_text(encoding='utf-8')).get('status', ''))" "$UPSTREAM_STATE" 2>/dev/null || true)
 [[ $ACTUAL_STATUS == "$UPSTREAM_STATUS" ]] || { echo "Upstream state mismatch: $ACTUAL_STATUS" >&2; exit 1; }
 if [[ -e $STATE ]]; then
-    "$PYTHON" -c "import json, sys; p=json.load(open(sys.argv[1], encoding='utf-8')); raise SystemExit(0 if p.get('status') == 'waiting' and p.get('run_id') == sys.argv[2] else 1)" "$STATE" "$RUN_ID" \
+    "$PYTHON" -c "import json, sys; p=json.load(open(sys.argv[1], encoding='utf-8')); raise SystemExit(0 if p.get('status') == 'waiting' and p.get('run_id') == sys.argv[2] and p.get('upstream_state') == sys.argv[3] and p.get('upstream_status') == sys.argv[4] else 1)" "$STATE" "$RUN_ID" "$UPSTREAM_STATE" "$UPSTREAM_STATUS" \
         || { echo "Run ID already exists: $STATE" >&2; exit 1; }
 fi
 
 mkdir -p "$RUN_ROOT/train" "$RUN_ROOT/test"
 [[ -e $LAUNCHER_LOG ]] || : > "$LAUNCHER_LOG"
 printf '%s\n' "$$" > "$RUN_ROOT/launcher.pid"
+echo "[$(date -u +%FT%TZ)] starting MSQ B0-B7 after RELIA status=$UPSTREAM_STATUS"
 
 cd /tmp
 export CUDA_VISIBLE_DEVICES=0

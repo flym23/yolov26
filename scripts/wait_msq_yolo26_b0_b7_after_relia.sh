@@ -11,15 +11,18 @@ PROJECT_ROOT=$1
 RUN_ID=$2
 SOURCE_ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
 PYTHON=/home/room305/miniconda3/envs/yolov26/bin/python
-UPSTREAM_STATE=/home/room305/ZZF/yolov26-relia/runs/relia_yolo26_20260814_045439/state.json
+UPSTREAM_STATE=/home/room305/ZZF/yolov26-relia/runs/relia_yolo26_20260814_082300/state.json
 RUN_ROOT="$PROJECT_ROOT/runs/msq_yolo26_b0_b7_$RUN_ID"
 STATE="$RUN_ROOT/state.json"
+LAUNCHER_LOG="$RUN_ROOT/train/launcher.log"
 
 [[ $PROJECT_ROOT == /* ]] || { echo "Project root must be absolute: $PROJECT_ROOT" >&2; exit 2; }
 [[ $RUN_ID =~ ^[A-Za-z0-9._-]+$ ]] || { echo "Invalid run ID: $RUN_ID" >&2; exit 2; }
 [[ -x $PYTHON ]] || { echo "Missing Python interpreter: $PYTHON" >&2; exit 1; }
 [[ ! -e $STATE ]] || { echo "Run ID already exists: $STATE" >&2; exit 1; }
 mkdir -p "$RUN_ROOT/train" "$RUN_ROOT/test"
+[[ -e $LAUNCHER_LOG ]] || : > "$LAUNCHER_LOG"
+exec >> "$LAUNCHER_LOG" 2>&1
 printf '%s\n' "$$" > "$RUN_ROOT/launcher.pid"
 
 write_wait_state() {
@@ -72,6 +75,7 @@ PY
         completed|failed|cancelled)
             echo "[$(date -u +%FT%TZ)] RELIA terminal state=$upstream_status reason=$upstream_reason"
             write_wait_state "$upstream_status" "$upstream_reason"
+            echo "[$(date -u +%FT%TZ)] launching MSQ B0-B7 with run_id=$RUN_ID"
             exec bash "$SOURCE_ROOT/scripts/run_msq_yolo26_b0_b7.sh" "$PROJECT_ROOT" "$RUN_ID" "$UPSTREAM_STATE" "$upstream_status" "$upstream_reason"
             ;;
         *)

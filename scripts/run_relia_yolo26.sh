@@ -19,6 +19,7 @@ WEIGHTS=/home/room305/ZZF/yolov26/yolo26n.pt
 STATS="$PROJECT_ROOT/runs/relia_yolo26_preflight/train_statistics.json"
 RUN_ROOT="$PROJECT_ROOT/runs/relia_yolo26_$RUN_ID"
 STATE="$RUN_ROOT/state.json"
+IDS=${RELIA_IDS:-A0,A1,A2,A3,A4,A5,A6,A7}
 
 [[ $PROJECT_ROOT == /* && $UPSTREAM_STATE == /* && $RUN_ROOT == /* ]] || { echo "All project/state paths must be absolute." >&2; exit 2; }
 [[ $RUN_ID =~ ^[A-Za-z0-9._-]+$ ]] || { echo "Invalid run ID: $RUN_ID" >&2; exit 2; }
@@ -36,4 +37,4 @@ export CUDA_VISIBLE_DEVICES=0
 exec "$PYTHON" "$SOURCE_ROOT/tools/urpc/run_relia_ablation.py" \
     --stage formal --run-id "$RUN_ID" --project "$RUN_ROOT" --data "$DATA" --weights "$WEIGHTS" --relia-stats "$STATS" \
     --upstream-state "$UPSTREAM_STATE" --upstream-status "$UPSTREAM_STATUS" --upstream-reason "$UPSTREAM_REASON" \
-    --ids A0,A1,A2,A3,A4,A5,A6,A7
+    --ids "$IDS"

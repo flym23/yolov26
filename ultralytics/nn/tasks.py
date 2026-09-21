@@ -737,7 +737,14 @@ class ReLiADetectionModel(DetectionModel):
         if not self.training:
             if self._validation_criterion is None:
                 self._validation_criterion = E2ELoss(self)
-            return self._validation_criterion(preds, batch)
+            total, native_items = self._validation_criterion(preds, batch)
+            items = {f"raw/{name}": value for name, value in native_items.items()}
+            items.update({f"degraded/{name}": value for name, value in native_items.items()})
+            auxiliary_zero = next(iter(native_items.values())).detach() * 0
+            for name, enabled in (("redpa", self.enable_redpa), ("psr", self.enable_psr), ("dsq", self.enable_dsq)):
+                if enabled:
+                    items[f"relia/{name}"] = auxiliary_zero
+            return total, items
         if getattr(self, "criterion", None) is None:
             self.criterion = self.init_criterion()
         if preds is None:
